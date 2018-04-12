@@ -1,0 +1,495 @@
+---
+title: "Data Engineering"
+author: "MP"
+date: "18 September 2017"
+output: html_document
+---
+
+
+
+```{r}
+# Initialize 
+
+library(data.table)
+library(stringr)
+library(dplyr)
+library(qdapRegex)
+
+```
+
+#set up functions
+
+```{r}
+quotemeta <- function(string) {
+  str_replace_all(string, "(\\W)", "\\\\\\1")
+}
+get.rel.position <- function(rel=relPos,no=NoPlayers){
+  ifelse(rel==no,1,rel+1)
+}
+
+get.playerID <- function(lines,row=k){
+  sub("(\\n)?\\\"(.*?): .*", "\\2", lines[row])
+}
+
+set.betsize <- function(action,action.type){
+  betsize=maxbet
+  if(action.type %in% c("raise","bet")){
+    betsize <- as.numeric(sub(".*(to|auf|setzt|bets) (\\$)?((\\d|\\.)+)(.*)?","\\3",action))
+    }
+  return(betsize)
+  }
+
+get.winner <- function(hand){
+ sub("^(.*) (gewinnt|collected) .*", "\\1",
+    hand[
+      grep("gewinnt|collected",hand)[1]
+      ]
+    ) 
+}
+
+get.hand <- function(hand,player){
+  if(length(grep(paste(quotemeta(player),": (zeigt|shows) \\[",sep=""),hand))==0) return("")
+  sub(".*\\[(.*)\\].*","\\1",
+  hand[grep(paste(quotemeta(player),": (zeigt|shows) \\[",sep=""),hand)]
+  )
+}
+
+count.actions <- function(actionlines){
+  actions.eng <- as.numeric(str_count(actionlines, c('folds','checks','calls','bets','raises')))
+  actions.ger <- as.numeric(str_count(actionlines, c('passt','checkt','geht','setzt','(erhöht|erh?ht)')))
+  actions.eng[6] <-sum(actions.eng)
+  actions.ger[6] <-sum(actions.ger)
+  ac <- actions.eng+actions.ger
+  names(ac) <- c('fold','check','call','bet','raise','total')
+  return(ac)
+}
+
+get.action.type <- function(raw){
+  case_when(
+    raw=="passt" ~ "fold",
+    raw=="checkt" ~ "check",
+    raw=="geht" ~ "call",
+    raw=="erhöht" ~ "raise",
+    raw=="erh?ht" ~ "raise",
+    raw=="setzt" ~ "bet",
+    raw=="folds" ~"fold",
+    raw=="checks" ~ "check",
+    raw=="calls" ~ "call",
+    raw=="raises" ~ "raise",
+    raw=="bets" ~ "bet"
+    )
+}
+
+refresh.pot.bet <- function(actions,recent.action=action,bets=prevBet,potsize=Pot,bet=betsize){
+  mb <- 0
+  prevBet <- as.numeric(bets)
+  pt <- as.numeric(potsize)
+        if(actions["raise"]>0){
+          if(grepl("(erhöht|erh?ht|raises)",recent.action)==TRUE){
+              prevBet = as.numeric(bets)+1
+              pt = potsize + bet
+              mb <- bet
+          }
+        }
+        
+        if(actions["bet"]>0){
+          if(grepl("(setzt|bets)",recent.action)==TRUE){
+              prevBet = as.numeric(bets)+1
+              pt = potsize + bet
+            mb <- bet
+          }
+        }
+        
+        if(actions["call"]>0){
+          if(grepl("(geht mit|calls)",recent.action)==TRUE){
+            if(grepl("[Aa]ll-in",recent.action)==TRUE){
+              pt = as.numeric(potsize) + as.numeric(sub("(geht mit|calls) .(.*?) .*","\\2",recent.action))
+            } else {
+              pt = as.numeric(potsize) + as.numeric(sub("(geht mit|calls) .(.*?)","\\2",recent.action))
+            }
+            mb <- 0
+          }
+        }
+  res <- c(prevBet,pt,mb)
+  return(as.numeric(res))
+}
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+parent.folder<-"/home/Max_Philipp/Master/PokerStars.15.11"
+#parent.folder<-"D:/Pokerbot/Master Daten/PokerStars.15.11"
+setwd(parent.folder)
+
+files <- character()
+files.inner <- character()
+
+  file.name.v <- list.files(parent.folder, pattern=".*\\.txt") #pattern for all hands
+  
+  for (f in file.name.v){
+    file.read.v <- scan(paste(parent.folder, f, sep="/"),
+                        what ="character",sep="\n",quiet = TRUE)
+    files.inner <- c(files.inner,file.read.v)
+  }
+  files <- c(files,files.inner)
+  files.inner <- character()
+
+rm(f,file.name.v,file.read.v,files.inner,k,parent.folder,r.scripts,sub.folders1,sub.folders2)
+
+
+  x <- files #all non topurnament files
+  keywords <- c("setzt sich auf", "verlässt den Tisch","verl?sst den Tisch", "Time Out","has timed out", "sagte","ist verbunden","ist nicht verbunden","wurde von Tisch","setzt aus",
+                "joins the table","has returned","connected","disconnect","leaves the"," said","is sitting out","will be allowed","ist zurück", "ist zur?ck","was removed","wurde entfernt")
+  buzzwords <- paste(keywords, collapse = "|")
+  
+  ptm <- proc.time()
+  x <- x[!grepl(buzzwords, x)] #around 4700 lines
+  proc.time() - ptm
+
+  ## Split up Log file in individual Hands
+  # Bug one hand
+#y <- rm_between_multiple(x,"PokerStars Hand ","PokerStars Hand ")
+#y <- str_split(x,"PokerStars Hand ")
+
+ptm <- proc.time()
+
+  cuts = grep(paste(c("PokerStars Hand ","PokerStars Zoom Hand ",
+                      "PokerStars Zoom-Hand ",
+                      "PokerStars Home Game Hand "),collapse="|"), x)
+  y = list()
+  for (i in 2:length(cuts)){
+    j = cuts[i-1]:(cuts[i]-1)
+    y[[i]] = x[j]
+  }
+  y <- y[-1]
+proc.time() - ptm
+rm(files,x,i,j,buzzwords,cuts,keywords)
+gc()
+```
+#read
+
+```{r}
+handstatistics <- list()
+logviews <- list()
+for(i in 1:80){
+  handstatistics[[i]] <- as.data.frame(c())
+  logviews[[i]] <- as.data.frame(c())
+}
+```
+
+
+```{r}  
+
+for(a in 1:80){
+v <- as.data.frame(c())
+Handstats <- as.data.frame(c())
+
+for(i in round(length(y)/20)*(a-1)+1:round(length(y)/20)*a){
+  print(i)
+    winner <- get.winner(y[[i]])
+    PSID <- sub(".*?PokerStars.+Hand (#)?(.*?): .*", "\\2", y[[i]])[1]
+    GameType <- sub(".*?: (.*?) - .*", "\\1", y[i])[1]
+    Date <- sub(".*( |\\[)((\\d|\\.|/)+ (\\d|\\:)+ ET).*","\\2",y[[i]][1])
+    TourID <- ""
+    if(grepl("(Tournament|Turnier)",GameType)){
+      TourID <- sub("(Tournament|Turnier) #([0-9]+), .*","\\2",GameType)
+    }
+    if(!grepl("(Tournament|Turnier)",GameType)){  
+      TourID <- sub("(Table|Tisch) \\'(.*?)\\' .*","\\2",y[[i]][2])
+    }
+    # Dealer Seat
+    Dealer <- as.numeric(sub(".*?#(.*?) is.*", "\\1", y[i]))
+    
+    NoPlayers <- as.numeric(str_count(y[i], 'in [Cc]hips'))
+    NoSeats <- as.numeric(sub(".*?.*'.*' (.*?)-max.*", "\\1", y[i]))
+    tourLvl <- ""
+    # Blinds Amount
+    if(!grepl("(Tournament|Turnier)",GameType)){
+      SB.amount <- as.numeric(sub(".*?((\\d|\\.)+)/.*", "\\1", GameType))
+      BB.amount <- as.numeric(sub(".*?/(\\$)?((\\d|\\.)+)( .*)?\\)", "\\2", GameType))
+    }
+    if(grepl("(Tournament|Turnier)",GameType)){
+      SB.amount <- sub(".* Level .* \\((.*?)/.*","\\1",y[[i]][1])
+      BB.amount <- sub(".* Level .*/(.*?)\\).*","\\1",y[[i]][1])
+      tourLvl <- sub(".*Level (\\w+) .*","\\1",y[[i]][1])
+    }
+    
+    
+    PLID <- c()
+    Stack <- c()
+    Seat <- c()
+    Blind <- c()
+    Blind.size <- c()
+   
+    RoundData <- c()
+    for(k in 1:NoPlayers){
+      Seat[k] <-  sub(".*? (.*?): .* in [Cc]hips.*", "\\1", y[[i]][k+2])
+      PLID[k] <- sub("(Seat|Platz) .: (.*?) \\(.*", "\\2", y[[i]][k+2])
+      Stack[k] <- sub(".*?: .*\\((\\$)?(.*?) in [Cc]hips.*", "\\2", y[[i]][k+2])
+      
+      Blind[k] <- ifelse(sum(grepl(paste(quotemeta(PLID[k]),": .* [Ss]mall [Bb]lind(:)? ",sep=""), y[[i]]))>=1,"SB",
+                         ifelse(sum(grepl(paste(quotemeta(PLID[k]),": .* [Bb]ig [Bb]lind(:)? ",sep=""), y[[i]]))>=1,"BB",""))
+      Blind.size[k] <- ifelse(Blind[k]=="SB",SB.amount,BB.amount)
+    }
+    
+    Dealer <- Seat==Dealer
+    RoundData <- cbind.data.frame(Index=i,GameID=PSID,TournamentID=TourID,PlayerID=PLID,Stack,Seat,Blind,Blind.size,Date,tourLvl,stringsAsFactors=FALSE)
+
+    Handstats <- rbind(Handstats,RoundData)
+
+    maxbet <- BB.amount
+    
+    prevBet = 0
+    
+    # Create RoundData Table
+    
+    Pot <- NULL
+    
+    ### Pre-Flop Action
+    PLremain = NoPlayers
+    preflopaction <- sub(".*?HOLE CARDS .......(.*?)\\* .*", "\\1", y[i])
+    prefloplines <- strsplit(preflopaction, ", ")[[1]]
+
+    PFactions <- count.actions(preflopaction)
+    
+    # Remove Hole Cards
+    prefloplines = prefloplines[-1]
+    
+    # Sum Blinds
+    Pot <- 0
+    if(PLremain>1 & PFactions["total"]>0){
+    
+    relPos <- 0
+    for (k in 1:PFactions["total"]){
+      if(PLremain>1){
+        
+        PLID <- get.playerID(prefloplines,k)
+        won <- ifelse(PLID==winner,1,0)
+        hand <- tryCatch({
+  get.hand(y[[i]],PLID)
+},
+error=function(err){
+  return("")
+  }
+)
+        t <- sub("^(.*): (.*)", "\\2", prefloplines[k])
+        action.raw <- sub(" .*", "", substr(t,0,nchar(t)-1)) #extracting the first word of the action for easier matching
+        action <- str_trim(substr(t,0,nchar(t)-1),"right") #keeping all relevant informations
+        
+        action.counter = 1
+        action.voluntary = 0
+        pfr.counter = 0
+        
+        action.type <- get.action.type(action.raw)
+        
+        if(action.type %in% c("call","raise")){
+          action.voluntary <- 1
+          if(action.type=="raise"){
+            pfr.counter <- 1
+          }
+        }
+        
+        betsize <- set.betsize(action,action.type)
+        
+
+        PLremain <- PLremain - as.numeric(action.type=="fold")
+        Round <- "Pre-Flop"
+        
+
+        r <- refresh.pot.bet(PFactions,recent.action=action,bets=prevBet,bet = betsize,potsize=Pot)
+        prevBet <- max(r[1],prevBet,na.rm = TRUE)
+        Pot <- max(r[2],Pot,na.rm = TRUE)
+        maxbet <- max(maxbet,r[3],na.rm = TRUE)
+        #commit <- get.commitment()
+        relPos <- get.rel.position()
+        
+        v <- rbind(v, data.frame(
+          action, action.type,betsize,PlayerID=PLID,PLremain,relPos,Round,maxbet,PSID,GameType,NoPlayers,prevBet,Pot,Board="Preflop",winner=won,shown.hand=hand,stringsAsFactors=FALSE))
+
+      }
+    }
+    }
+    
+  if(max(grepl("FLOP",y[[i]]))==1){  
+    flopaction <- sub(".*?FLOP ....(.*?)\\* .*", "\\1", y[i])
+    floplines <- strsplit(flopaction, ", ")[[1]]
+    Board <- floplines[1]
+    
+    NoPlayers <- PLremain
+    
+    # Count fold, check, call, bet, raise
+    FLactions <- count.actions(flopaction)
+    
+    ### Flop Action
+    if(PLremain>1 & FLactions["total"]>0){
+      
+      #Remove Flop
+      floplines = floplines[-1]
+      
+      # Maxbet Reset
+      maxbet = 0
+      prevBet = 0
+      
+      relPos <- 0
+      for (k in 1:FLactions["total"]){
+        
+        PLID <- get.playerID(floplines,k)
+        won <- ifelse(PLID==winner,1,0)
+        
+       t <- sub("^(.*): (.*)", "\\2", floplines[k])
+        action.raw <- sub(" .*", "", substr(t,0,nchar(t)-1)) #extracting the first word of the action for easier matching
+        action <- str_trim(substr(t,0,nchar(t)-1),"right") #keeping all relevant informations
+        
+        action.counter = 1
+        action.voluntary = 0
+        pfr.counter = 0
+        
+        
+        action.type <- get.action.type(action.raw)
+        
+
+        betsize <- set.betsize(action,action.type)
+
+
+        
+        PLremain <- PLremain - as.numeric(action.type=="fold")
+        Round <- "Flop"
+        r <- refresh.pot.bet(FLactions,bet = betsize,potsize=Pot)
+        prevBet <- max(r[1],prevBet,na.rm = TRUE)
+        Pot <- max(r[2],Pot,na.rm = TRUE)
+        maxbet <- max(maxbet,r[3],na.rm = TRUE)
+        #commit <- get.commitment()
+        relPos <- get.rel.position()
+        
+        v <- rbind(v, data.frame(
+          action, action.type,betsize,PlayerID=PLID,PLremain,relPos,Round,maxbet,PSID,GameType,NoPlayers,prevBet,Pot,Board=Board,winner=won,shown.hand="",stringsAsFactors=FALSE))
+
+      }
+    }}
+
+if(max(grepl("TURN",y[[i]]))==1){
+    turnaction <- sub(".*?TURN ....(.*?)\\* .*", "\\1", y[i])
+    turnlines <- strsplit(turnaction, ", ")[[1]]
+    Board <- turnlines[1]
+    
+    NoPlayers <- PLremain
+
+    TUactions <- count.actions(turnaction)
+    
+    ### Turn Action
+    if(PLremain>1 & TUactions["total"]>0){
+      
+      # Remove Turn
+      turnlines = turnlines[-1]
+      
+      # Maxbet Reset
+      maxbet = 0
+      prevBet = 0
+      
+      relPos <- 0
+      for (k in 1:TUactions["total"]){
+        
+        PLID <- get.playerID(turnlines,k)
+        won <- ifelse(PLID==winner,1,0)
+        
+        t <- sub("^(.*): (.*)", "\\2", turnlines[k])
+        action.raw <- sub(" .*", "", substr(t,0,nchar(t)-1)) #extracting the first word of the action for easier matching
+        action <- str_trim(substr(t,0,nchar(t)-1),"right") #keeping all relevant informations
+        
+        action.counter = 1
+        action.voluntary = 0
+        pfr.counter = 0
+        
+        action.type <- get.action.type(action.raw)
+
+        betsize <- set.betsize(action,action.type)
+        
+
+        
+        PLremain <- PLremain - as.numeric(action.type=="fold")
+        Round <- "Turn"
+        r <- refresh.pot.bet(TUactions,bet = betsize,potsize=Pot)
+        prevBet <- max(r[1],prevBet,na.rm = TRUE)
+        Pot <- max(r[2],Pot,na.rm = TRUE)
+        maxbet <- max(maxbet,r[3],na.rm = TRUE)
+        #commit <- get.commitment()
+        relPos <- get.rel.position()
+        
+        v <- rbind(v, data.frame(
+          action, action.type,betsize,PlayerID=PLID,PLremain,relPos,Round,maxbet,PSID,GameType,NoPlayers,prevBet,Pot,Board=Board,winner=won,shown.hand="",stringsAsFactors=FALSE))
+
+
+      }
+    }}
+
+    if(max(grepl("RIVER",y[[i]]))==1){
+    riveraction <- sub(".*?RIVER ....(.*?)\\* .*", "\\1", y[i])
+    riverlines <- strsplit(riveraction, ", ")[[1]]
+    Board <- riverlines[1]
+    
+    NoPlayers <- PLremain
+
+    RIactions <- count.actions(riveraction)
+    
+    ### River Action
+    if(PLremain>1 & RIactions["total"]>0){
+      
+      # Remove river
+      riverlines = riverlines[-1]
+      
+      # Maxbet Reset
+      maxbet = 0
+      prevBet = 0
+      
+      relPos <- 0
+      for (k in 1:RIactions["total"]){
+        
+        PLID <- get.playerID(riverlines,k)
+        won <- ifelse(PLID==winner,1,0)
+
+        t <- sub("^(.*): (.*)", "\\2", riverlines[k])
+        action.raw <- sub(" .*", "", substr(t,0,nchar(t)-1)) #extracting the first word of the action for easier matching
+        action <- str_trim(substr(t,0,nchar(t)-1),"right") #keeping all relevant informations
+        
+        action.counter = 1
+        action.voluntary = 0
+        pfr.counter = 0
+        
+        action.type <- get.action.type(action.raw)
+        
+        betsize <- set.betsize(action,action.type)
+        
+
+        
+        PLremain <- PLremain - as.numeric(action.type=="fold")
+        Round <- "River"
+        r <- refresh.pot.bet(RIactions,bet = betsize,potsize=Pot)
+        prevBet <- max(r[1],prevBet,na.rm = TRUE)
+        
+        Pot <- max(r[2],Pot,na.rm = TRUE)
+        maxbet <- max(maxbet,r[3],na.rm = TRUE)
+        #commit <- get.commitment()
+        relPos <- get.rel.position()
+        
+        v <- rbind(v, data.frame(
+          action, action.type,betsize,PlayerID=PLID,PLremain,relPos,Round,maxbet,PSID,GameType,NoPlayers,prevBet,Pot,Board=Board,winner=won,shown.hand="",stringsAsFactors=FALSE))
+        
+
+      }
+    }}
+    }
+handstatistics[[a]] <- Handstats
+logviews[[a]] <- v
+print(a)
+}
+
+library(plyr)
+Logdata <- ldply(logviews, data.frame)
+Handstats<- ldply(handstatistics, data.frame)
+save(Logdata,file="Logdata_2311.rda")
+save(Handstats,file="Handdata_2311.rda")
+```
+
+
+
+
