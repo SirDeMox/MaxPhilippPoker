@@ -188,6 +188,7 @@ Before the hole cards are dealt the two players left of the dealer have to place
 #Essentials of Holecards
 
 ```{r, message=FALSE, warning=FALSE, include=FALSE}
+#loading in packages
 library(holdem)
 library(dplyr)
 library(doParallel)
