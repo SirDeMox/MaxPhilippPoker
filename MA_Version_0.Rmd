@@ -189,6 +189,7 @@ Before the hole cards are dealt the two players left of the dealer have to place
 
 ```{r, message=FALSE, warning=FALSE, include=FALSE}
 #loading in packages
+#some are actually not needed
 library(holdem)
 library(dplyr)
 library(doParallel)
